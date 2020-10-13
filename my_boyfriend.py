@@ -1,43 +1,18 @@
 import argparse                                 # Args
-import socket, select, ssl                      # Networking
+import socket, select                           # Networking
 import multiprocessing, subprocess              # Multiprocessing and signals
 import traceback, sys, os, tempfile, ast, time  # Misc
+import binascii
 
-import util_tls                                 # Utilities
+
 
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument(
-    "--skip_tls", action="store_true",  # Will be False unless specified on CLI
-    help="Whether or not to use TLS at all."
-)
-arg_parser.add_argument(
-    "--static_servername", action="store_true",  # Will be False unles specified on CLI
-    help="Determines whether to use a static hostname in the server certificate. If true, "
-         "--server_cert and --server_key are used as-is in negotiating TLS connections. If "
-         "false, alsanna will inspect the TLS handshake and generate a leaf certificate "
-         "signed by --server_cert, attempting to match the hostname requested by the "
-         "client. If the client does not use the SNI TLS extension to specify a hostname, "
-         "--servername will be used instead."
-)
-arg_parser.add_argument(
-    "--servername", type=str, default="example.com",
-    help="Default server name to use when dynamically generating leaf certificates and "
-         "the client does not use SNI to indicate the server name it expects."
-)
-arg_parser.add_argument(
-    "--serv_cert", type=str, default="./tls_cert.pem",
-    help="Path to a TLS certificate trusted by the software that produces your traffic."
-)
-arg_parser.add_argument(
-    "--serv_priv_key", type=str, default="./tls_key.pem",
-    help="Path to the private key associated with the TLS certificate."
-)
-arg_parser.add_argument(
-    "--listen_ip", type=str, default="127.0.0.1",
+    "--listen_ip", type=str, default="0.0.0.0",
     help="IP address of a local interface to listen on."
 )
 arg_parser.add_argument(
-    "--listen_port", type=int, default=443,
+    "--listen_port", type=int, default=1414,
     help="TCP port to listen for incoming connections on."
 )
 arg_parser.add_argument(
@@ -49,11 +24,11 @@ arg_parser.add_argument(
     help="Number of bytes read from wire before forwarding."
 )
 arg_parser.add_argument(
-    "--server_ip", type=str, default="127.0.0.1",
+    "--server_ip", type=str, default="172.17.0.2",
     help="IP address of the server your traffic is ultimately bound for."
 )
 arg_parser.add_argument(
-    "--server_port", type=int, default=443,
+    "--server_port", type=int, default=1414,
     help="TCP port on remote server to send traffic to; probably same as listen_port."
 )
 arg_parser.add_argument(
@@ -73,7 +48,7 @@ arg_parser.add_argument(
     help="Command to use for launching editor."
 )
 arg_parser.add_argument(
-    "--pass_client", action="store_true",  # Will be False unless supplied on CLI
+    "--intercept_client", action="store_true",  # Will be False unless supplied on CLI
     help="Whether to intercept client-sent data for editing."
 )
 arg_parser.add_argument(
@@ -86,9 +61,6 @@ arg_parser.add_argument(
 )
 
 args = arg_parser.parse_args()
-
-# A dumb hack to get Python to ignore TLS certs
-ssl._create_default_https_context = ssl._create_unverified_context
 
 def format_error(error_message):
     return "\033[38;5;" + str(args.error_color) + "m" + error_message + "\033[0m"
@@ -132,12 +104,31 @@ def process_messages(preprocessing_q):
         else:
             color = 8  # If this ever gets used something's gone wrong.
 
+
+        if (connection_id[-1] == "c"):
+            message_hex = binascii.hexlify(message)
+            #reduce the FAP level to 9
+            if (message_hex.find(b'49442020') > -1):
+                message_hex = message_hex.replace(b'494420200d', b'494420200c')
+                message_hex = message_hex.replace(b'494420200e', b'494420200c')
+                message_hex = message_hex.replace(b'494420200f', b'494420200c')
+                message_hex = message_hex.replace(b'4944202010', b'494420200c')
+                message_hex = message_hex.replace(b'4944202011', b'494420200c')
+            if (message_hex.find(b'43415554') > -1):
+                print(str(binascii.unhexlify(message_hex[message_hex.find(b'43415554'):])))
+            message = binascii.unhexlify(message_hex)
+
+
+
+
+        message = str(message)
         colorful = "\033[38;5;" + str(color) + "m" + message + "\033[0m"
-        print(colorful)  # Print received message
+        #print(colorful)  # Print received message
 
         # Open the message in an editor if required
+
         try:
-            if (connection_id[-1] == "c" and not args.pass_client) \
+            if (connection_id[-1] == "c" and args.intercept_client) \
                     or (connection_id[-1] == "s" and args.intercept_server):
                 with tempfile.NamedTemporaryFile(mode="w+") as tmpfile:
                     tmpfile.write(message)
@@ -184,15 +175,10 @@ def forward(receive_sock, send_sock, processing_q, result_q, connection_id):
         return True  # Something bad happened, close the sockets.
 
     if receive_sock in readable and (send_sock in writable or send_sock is None):
-        try:
-            data_bytes = receive_sock.recv(args.read_size)
-        except ssl.SSLWantReadError:  # Raw socket data but incomplete SSL frame
-            return False  # No problem, just no data yet...
+        data_bytes = receive_sock.recv(args.read_size)
         if len(data_bytes) == 0:  # Signifies connection is closed on the remote end.
             return True
-        data_string = str(data_bytes)
-
-        processing_q.put((connection_id, data_string))
+        processing_q.put((connection_id, data_bytes))
         try:
             data_string = result_q.get()  # Blocks until processed message available
 
@@ -200,10 +186,6 @@ def forward(receive_sock, send_sock, processing_q, result_q, connection_id):
                 try:
                     return_sock = True
                     send_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-                    if not args.skip_tls:
-                        f_tls_context = ssl.create_default_context()
-                        f_tls_context.check_hostname = False
-                        send_sock = f_tls_context.wrap_socket(send_sock)
                     send_sock.connect((args.server_ip, args.server_port))
                     send_sock.setblocking(False)
                 except:
@@ -220,10 +202,7 @@ def forward(receive_sock, send_sock, processing_q, result_q, connection_id):
             try:
                 sent = 0
                 while sent < len(data_bytes):
-                    try:
-                        sent += send_sock.send(data_bytes[sent:])
-                    except ssl.SSLWantWriteError:
-                        continue  # No real problem, SSL socket just not ready
+                    sent += send_sock.send(data_bytes[sent:])
             except:
                 processing_q.put(("Err", "Error forwarding message to destination.\n"
                                          + traceback.format_exc()))
@@ -262,24 +241,6 @@ def manage_connections(listen_sock, processing_q, connection_id):
 
     with listen_sock:
         forward_sock = None
-        if not args.skip_tls:
-            try:
-                l_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                if args.static_servername:
-                    l_tls_context.load_cert_chain(args.serv_cert, args.serv_priv_key)
-                else:
-                    l_tls_context.set_servername_callback(
-                        util_tls.leaf_sign(args.serv_cert,
-                                           args.serv_priv_key,
-                                           args.servername)
-                    )
-                listen_sock = l_tls_context.wrap_socket(listen_sock,
-                                                        server_side=True)
-                listen_sock.setblocking(False)
-            except:
-                processing_q.put(("Err", "Error setting up TLS listener.\n"
-                                         + traceback.format_exc()))
-                return
 
         ############################################################################
         # Shuffle bytes back and forth, setting up forwarder on first sent message #
@@ -298,8 +259,7 @@ def manage_connections(listen_sock, processing_q, connection_id):
                         client_done = forward(listen_sock, forward_sock,
                                               processing_q, c_result_q,
                                               str(connection_id) + "c")
-                        if isinstance(client_done, ssl.SSLSocket) \
-                                or isinstance(client_done, socket.socket):
+                        if  isinstance(client_done, socket.socket):
                             forward_sock = client_done
                             client_done = False
                     except:
